@@ -5,9 +5,10 @@ Chip-specific bootloader info: https://www.st.com/content/ccc/resource/technical
 '''
 
 import logging
+import time
 
 from .base import SerialContext
-from .result import Result, OddResultException
+from .result import Result, OddResultException, ResetResultException
 
 
 BOOTLOADER_INIT = b"\x7f"
@@ -30,7 +31,7 @@ class STM32ReadoutLevel1Context(SerialContext):
     def __init__(self, scope, address=0x08000000, size=256, 
                  baudrate=9600):
         # AFAIK all STM32 bootloaders use even parity and 1 stop bit
-        super().__init__(self, scope, baudrate=baudrate,
+        super().__init__(scope, baudrate=baudrate,
                          stopbits=1, parity="even")
 
         self.address = address
@@ -47,13 +48,19 @@ class STM32ReadoutLevel1Context(SerialContext):
         If the byte read IS an ACK, return True.
         '''
         
-        ack_maybe = self.read(1)[0]
+        ack_maybe = self.read(1)
         if ack_maybe == ACK:
+            logging.debug("Received ACK")
             return True
         elif ack_maybe == NACK:
+            logging.debug("Received NACK")
             raise ValueError("NACK")
+        elif ack_maybe == b"":  # no response
+            logging.debug("No response.")
+            raise ResetResultException
         else:
-            raise OddResultException(f"Received unknown response ({ack_maybe})")
+            logging.debug(f"Received unknown response ({ack_maybe})")
+            raise OddResultException(ack_maybe)
 
     def init_bootloader(self):
         '''Initialize the bootloader.
@@ -61,10 +68,12 @@ class STM32ReadoutLevel1Context(SerialContext):
         This is done by simply sending an 0x7f byte and checking for an ACK.
         This method will not reset the target.
         '''
+        logging.debug("initializing bootloader")
+        self.flush()
         self.write(BOOTLOADER_INIT)
         try:
             self.read_ack()
-        except ValueError, OddResultException:
+        except (ValueError, OddResultException):
             return False
         else:
             return True
@@ -74,14 +83,15 @@ class STM32ReadoutLevel1Context(SerialContext):
         
         This is supposed to also return readout protection status,
         but it actually doesn't in the bootrom I looked at.'''
+        print("Sending GV")
         self.write(COMMAND_GV)
         self.read_ack()
-        bootloader_version = int.from_bytes(self.read(1)[0], byteorder="big")
-        bootloader_major = bootloader_version & 0xf0
+        bootloader_version = int.from_bytes(self.read(1), byteorder="big")
+        bootloader_major = (bootloader_version & 0xf0) >> 4
         bootloader_minor = bootloader_version & 0x0f
         # options hardcoded to 0 in the bootrom I reversed (stm32f103 v2.2)
-        option_1 = self.read(1)[0]
-        option_2 = self.read(1)[0]
+        option_1 = self.read(1)
+        option_2 = self.read(1)
         self.read_ack()  # it sends an ack again, idk why
         return (bootloader_major, bootloader_minor)
 
@@ -91,6 +101,7 @@ class STM32ReadoutLevel1Context(SerialContext):
         If RDP is enabled (or not glitched around), this will raise a ValueError.
         If an odd value (neither ACK nor NACK) is returned, an OddResultException is raised.
         '''
+        logging.debug("Sending read command")
         self.write(COMMAND_READ)
         return self.read_ack()  # will raise exceptions
 
@@ -101,6 +112,7 @@ class STM32ReadoutLevel1Context(SerialContext):
         Send 4 address bytes MSB to LSB followed by a checksum.
         '''
         
+        logging.debug("Sending address for memory read.")
         # MSB to LSB, so big endian
         addr_bytes = address.to_bytes(4, byteorder="big")
         checksum = (addr_bytes[3] ^ addr_bytes[2] ^ addr_bytes[1] ^ addr_bytes[0]).to_bytes(1, byteorder="big")
@@ -115,6 +127,7 @@ class STM32ReadoutLevel1Context(SerialContext):
         Note that size - 1 is sent, as the max size is 256 and min is 1.
         '''
 
+        logging.debug("Sending size for memory read.")
         wire_size = (size - 1).to_bytes(1, byteorder="big")
         checksum = (~wire_size & 0xff).to_bytes(1, byteorder="big")
         self.write(wire_size + checksum)
@@ -134,18 +147,31 @@ class STM32ReadoutLevel1Context(SerialContext):
             logging.error("Could not initialize bootloader. Check connections (BOOT pins, power, etc)")
             return False
         
-        v_major, v_minor = get_version()
-        logging.info(f"Bootloader version: {v_major}.{v_minor}")
+        v_major, v_minor = self.get_version()
+        logging.warning(f"Bootloader version: {v_major}.{v_minor}")
         try:
-            self.read_memory()
+            self.start_read_memory()
         except ValueError:
-            logging.info("Readout protection is enabled.")
+            logging.warning("Readout protection is enabled.")
             return True
         # we don't handle OddValueException, because we aren't glitching
         # so if it's not returning an expected value, something is probably wrong
         else:
-            logging.info("Readout protection is disabled. Nothing to do here.")
+            logging.warning("Readout protection is disabled. Nothing to do here.")
             return False
+
+    def test_setup(self):
+        self.reset()
+        try:
+            running = self.init_bootloader()
+        except ResetResultException:  # chip is still crashed
+            running = False
+        if not running:
+            # bootloader isn't responding
+            # wait a second and try again
+            logging.info("Bootloader not responding, trying again in 0.5s")
+            time.sleep(0.5)
+            self.test_setup()
 
     def test_one(self):
         '''Try to read from memory through the bootloader.
@@ -155,16 +181,16 @@ class STM32ReadoutLevel1Context(SerialContext):
         ACK if readout protection is disabled, NACK if enabled.
         So, if we can get it to ACK, we may have gotten around RDP.
         '''
-        
-        self.reset()
-        self.init_bootloader()
+
+        self.scope.arm()
         try:
             ack = self.start_read_memory()
+            self.scope.capture()
         except ValueError:  # NACK, not interesting
             return Result.NORMAL
         except OddResultException:  # neither ACK nor NACK
             return Result.ODD
-        except IndexError:  # read() returned [], no data
+        except ResetResultException:  # read() returned [], no data
             return Result.MUTE
         
         if ack:
@@ -174,3 +200,6 @@ class STM32ReadoutLevel1Context(SerialContext):
             # or maybe it'll ACK all three but not send data
             # but, it's a start
             return Result.SUCCESSFUL
+    
+    def test_teardown(self):
+        self.flush()

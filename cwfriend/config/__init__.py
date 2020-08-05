@@ -1,0 +1,1 @@
+from .external_trigger_vcc import ExternalOneShotTriggerVCCGlitchConfig

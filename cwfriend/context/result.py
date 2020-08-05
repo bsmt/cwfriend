@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import IntEnum
 
 
-class Result(Enum):
+class Result(IntEnum):
     '''
     Results have a few different categories:
     * NORMAL - The target is behaving normally.
@@ -12,11 +12,19 @@ class Result(Enum):
         It is up to the context class to determine what requirements
         this case has.
     * SUCCESSFUL - The target behaves as we'd like it to.
+
+    These are ordered by importance.
     '''
     NORMAL = 1
     MUTE = 2
     ODD = 3
     SUCCESSFUL = 4
+
+
+class ResetResultException(Exception):
+    '''An exception class that can be used to indicate
+    a condition where the target has crashed or reset.'''
+    pass
 
 
 class OddResultException(Exception):

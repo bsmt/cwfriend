@@ -1,6 +1,6 @@
 import time
 
-from chipwhisperer.hardware.newaeusb.serial import USART
+from chipwhisperer.hardware.naeusb.serial import USART
 
 from .result import Result
 
@@ -73,14 +73,14 @@ class SerialContext(Context):
         stopbits can be 1, 1.5, or 2
         parity can be one of "none","odd","even","mark","space
         '''
-        super().__init__(self, scope)
+        super().__init__(scope)
 
         # TODO: sanity check these
         self.baudrate = baudrate
         self.stopbits = stopbits
         self.parity = parity
 
-        self.serial = USART(self.scope._cwusb)
+        self.serial = USART(self.scope._getNAEUSB())
         self.serial.init(baudrate, stopbits, parity)
 
     def read(self, n_chars, timeout=250):
@@ -92,7 +92,7 @@ class SerialContext(Context):
         If n_chars = 0, all data present is returned.
         This will return data in a list, so if there is no data you will receive an empty list.
         '''
-        return self.serial.read(n_chars, timeout)
+        return bytes(self.serial.read(n_chars, timeout))
     
     def write(self, data):
         '''Write `data` over UART.
@@ -105,3 +105,25 @@ class SerialContext(Context):
     def flush(self):
         '''Delete all data from the UART Rx buffer.'''
         self.serial.flush()
+
+    def test_setup(self):
+        '''Called by the search strategy before an iteration should start.
+        
+        You can put device setup things here, like resetting and initializing state
+        especially if they don't need to happen every iteration.
+        '''
+        pass
+
+    def test_one(self):
+        '''Called by the search strategy when it is time to do a test.
+        
+        You can put all of your logic here if it's simple enough.
+        '''
+        pass
+
+    def test_teardown(self):
+        '''Called by the search strategy after the test is performed and processed.
+        
+        You can put device teardown things here, like serial buffer flushing.
+        '''
+        pass

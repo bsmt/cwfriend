@@ -1,13 +1,18 @@
 import math
 import logging
 
+import pandas
+
 
 class SearchStrategy(object):
     '''Base class for search strategies.
     
     Search strategies should iterate through a supplied search range,
     set the parameters in the scope, tell the context what to do, and
-    interpret results.'''
+    interpret results.
+    
+    Results are stored in a Pandas DataFrame. You can add results by
+    '''
 
     def __init__(self, scope, context, iteration_delay=0.1):
         '''
@@ -17,9 +22,9 @@ class SearchStrategy(object):
         '''
         self.scope = scope
         self.context = context
-        # results map a parameter set to a Result
-        # you can order this however you want, as long as it's consistent
-        self.results = []
+        self.iteration_delay = iteration_delay
+
+        self.results = pandas.DataFrame()
 
     def search(self):
         '''Start iterating through test cases.
@@ -27,6 +32,15 @@ class SearchStrategy(object):
         Call test_one on context each iteration and store results.
         '''
         pass
+
+    def add_result(self, result):
+        '''Store the result for the last test case.
+        
+        This will be placed in the self.results pandas dataframe.
+        Items are a dictionary with parameter names as keys,
+        and the Result enum under a "result" key.
+        '''
+        self.results = self.results.append({"result": result.name})
 
 
 class VCCGlitchSearchStrategy(SearchStrategy):
@@ -65,24 +79,25 @@ class VCCGlitchSearchStrategy(SearchStrategy):
     We'll see if that is reliable with ChipWhisperer.
     '''
     
-    def __init__(self, scope, context, offset_range, width_range,
-                 iteration_delay=0.1):
-        '''Initialize VCC Glitch strategy.
+    def __init__(self, scope, context, iteration_delay=0.1, min_width_percent=1.0):
+        super().__init__(scope, context, iteration_delay=iteration_delay)
+
+        self.min_width_percent = min_width_percent
+
+    def constrain_width(self, desired_width):
+        '''ChipWhisperer may not make substantial glitches at low width percentages.
         
-        offset_range and width_range are three-tuples with
-        (start, end, granularity). All values in seconds.
-        You can use e-6 to get microseconds, and e-9 for nanoseconds.
+        Use this to constrain a desired width into a range from
+        self.min_width_percent to 49.8. Calculation is based on a simple proportion.
+
+        desired_width / 100 = new_width / (49.8 - min_width)
         '''
-        
-        super().__init__(self, scope, context, iteration_delay=iteration_delay)
 
-        self.offset_start = offset_range[0]
-        self.offset_end = offset_range[1]
-        self.offset_granularity = offset_range[2]
-
-        self.width_start = width_range[0]
-        self.width_end = width_range[1]
-        self.width_granularity = width_range[2]
+        new_width = (desired_width * (49.8 - self.min_width_percent)) / 100
+        # this gets us a width between 0 and (49.8 - min_width)
+        # add it back to min_width to get us in the range we want
+        new_width += self.min_width_percent
+        return new_width
 
     def calculate_offset_parameters(self, desired_offset, ext_only=False):
         '''Configure ChipWhisperer to place a glitch at `desired_offset` from trigger.
@@ -93,6 +108,8 @@ class VCCGlitchSearchStrategy(SearchStrategy):
         offset_fine will be set to zero always.
         '''
 
+        logging.info(f"Calculating parameters for offset of {desired_offset}")
+
         # TODO: Incorporate CW triggering delay?
         # Even at ext_offset = 0, i seem to be a little after the trigger
         
@@ -102,24 +119,32 @@ class VCCGlitchSearchStrategy(SearchStrategy):
         # calculate rough ext_offset
         ext_offset_ideal = desired_offset / glitch_clk_period
         ext_offset = math.floor(ext_offset_ideal)
-        logging.debug(f"Setting ext_offset to {ext_offset} for desired offset of {desired_offset}")
+        logging.debug(f"Setting ext_offset to {ext_offset}")
         self.scope.glitch.ext_offset = ext_offset
-        self.scope.glitch.offset = 1.0
-        self.scope.glitch.offset_fine = 0.0  # ignore offset_fine for now
+        #self.scope.glitch.offset = 1.0
+        self.scope.glitch.offset_fine = 0  # ignore offset_fine for now
         if ext_only:  # we're done
             return
 
         # turn the remaning fraction of a cycle into offset
         # TODO: Can chipwhisperer handle 0%?
         ## if it logs a lot, let's just set it to 1% or something in those cases
-        ext_frac = math.modf(ext_offset_ideal)
+        ext_frac = math.modf(ext_offset_ideal)[0]
         if ext_frac > 0.50:
             # we can't go over ~50% of a clock
             # so if it's above that there, let's increment ext_off and use negative width
             self.scope.glitch.ext_offset += 1
-            negative_offset = (1.0 - ext_frac) * -1
+            negative_offset = (1.0 - ext_frac) * -10.0
+            if -1.0 < negative_offset < 1.0:
+                negative_offset = -10.0  # low offsets don't work
+            logging.debug(f"Setting offset to {negative_offset}")
             self.scope.glitch.offset = negative_offset
         else:
+            if -1.0 < ext_frac < 1.0:
+                ext_frac = 10.0
+            else:
+                ext_frac *= 10.0
+            logging.debug(f"Setting offset to {ext_frac}")
             self.scope.glitch.offset = ext_frac
 
     def calculate_width_parameters(self, desired_width):
@@ -127,20 +152,40 @@ class VCCGlitchSearchStrategy(SearchStrategy):
         
         If the desired width is longer than one clock cycle for the glitch module,
         the repeat paramter will be used to attempt to make one large pulse.
-        This may not be very accurate, however.
-        '''
         
+        Unfortunately, ChipWhisperer's MOSFETs often cannot do extremely quick pulses.
+        These tend to show up as little blips in the power, barely dropping 0.25V.
+        It probably depends a lot on your target, but I've had the most luck keeping
+        my width percentage above 35%. You can use the class min_width_percent variable
+        to set this.
+
+        This will only use positive width parameters to keep things simple.
+        '''
+
+        logging.info(f"Calculating parameters for width of {desired_width}")
+
         glitch_clk_freq = self.scope.clock.clkgen_freq
         glitch_clk_period = 1 / glitch_clk_freq
-        max_single_width = glitch_clk_period / 2
+        max_single_width = glitch_clk_period
+        self.scope.glitch.width_fine = 0  # ignore width_fine for now
 
         if desired_width < max_single_width:
             # we can use one cycle
-            width_percentage = (desired_width / glitch_clk_period) * 100
+            width_percentage = self.constrain_width((desired_width / max_single_width) * 100)
             self.scope.glitch.width = width_percentage
+            logging.debug(f"Setting glitch width to {width_percentage}%")
+            self.scope.glitch.repeat = 1
+            logging.debug("Setting glitch repeat to 1")
         else:
-            # we need to use repeat to make multiple pulses, and try to join them
-            pass
-
-# 07384615.384615385
-# 16000000.0
+            # we need to use repeat to make multiple pulses
+            # the pulses will be pretty distinct until you get to widths close to 50%
+            # they look the same for positive/negative
+            repeat_ideal = desired_width / glitch_clk_period
+            repeat = math.floor(repeat_ideal)
+            repeat_frac = self.constrain_width(math.modf(repeat_ideal)[0])
+            # constrain_width will clamp the fractional part between (min_width, 49.8)
+            width_percentage = self.constrain_width(repeat_frac)
+            logging.debug(f"Setting glitch width to {width_percentage}%")
+            self.scope.glitch.width = width_percentage
+            logging.debug(f"Setting glitch repeat to {repeat}")
+            self.scope.glitch.repeat = repeat
